@@ -1,0 +1,339 @@
+---
+title: "Text Data for 570 Project"
+author: "Group 5"
+date: "2025-04-15"
+output: html_document
+
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r}
+library(httr)
+library(jsonlite)
+library(tidyverse)   # includes dplyr, ggplot2, and stringr among others
+library(tidytext)
+library(stopwords)
+library(SnowballC)
+library(readr)       # for write_csv()
+
+```
+
+```{r}
+library(httr)
+library(jsonlite)
+library(tidyverse)  # for map_df()
+
+api_key <- "33fd62e222f14637bebb11af909754ad"
+base_url <- "https://newsapi.org/v2/everything"
+
+# Define language-specific search queries.
+# You may adjust the translations to best match terms used in media for that language.
+queries <- list(
+  en = "((\"Trump tariffs\" OR \"tariff policy\" OR \"tariff announcement\" OR \"import tariffs\" OR \"export tariffs\" OR \"tariff retaliation\" OR \"US-China tariffs\" OR \"US-Canada tariffs\" OR \"US-Mexico tariffs\" OR \"US-EU trade\") AND (\"stock market impact\" OR \"company impact\" OR \"Apple\" OR \"stock performance\" OR \"market reaction\"))",
+  zh = "((\"特朗普关税\" OR \"关税政策\" OR \"关税公告\" OR \"进口关税\" OR \"出口关税\" OR \"关税报复\") AND (\"股市影响\" OR \"公司影响\" OR \"股市表现\" OR \"市场反应\"))",
+  fr = "((\"Tarifs Trump\" OR \"politique tarifaire\" OR \"annonce tarifaire\" OR \"tarifs d'importation\" OR \"tarifs d'exportation\" OR \"représailles tarifaires\" OR \"tarifs US-Chine\" OR \"tarifs US-Canada\" OR \"tarifs US-Mexique\" OR \"commerce US-UE\") AND (\"impact sur le marché boursier\" OR \"impact sur les entreprises\" OR \"performance boursière\" OR \"réaction du marché\"))",
+  es = "((\"Aranceles Trump\" OR \"política arancelaria\" OR \"anuncio arancelario\" OR \"aranceles de importación\" OR \"aranceles de exportación\" OR \"represalias arancelarias\" OR \"aranceles EE.UU.-China\" OR \"aranceles EE.UU.-Canadá\" OR \"aranceles EE.UU.-México\" OR \"comercio EE.UU.-UE\") AND (\"impacto en el mercado bursátil\" OR \"impacto en las empresas\" OR \"rendimiento bursátil\" OR \"reacción del mercado\"))"
+)
+
+languages <- c("en", "zh", "fr", "es")
+
+# Use map_df from purrr to iterate over each language and combine the results
+articles_df <- map_df(languages, function(lang) {
+  params <- list(
+    q = queries[[lang]],  # Select the query for the specific language
+    language = lang,
+    sortBy = "publishedAt",
+    pageSize = 100,
+    apiKey = api_key
+  )
+  
+  # Send the GET request for the given language
+  response <- GET(url = base_url, query = params)
+  
+  if (status_code(response) != 200) {
+    warning("API request failed for language: ", lang)
+    return(NULL)
+  }
+  
+  # Parse the JSON content
+  data_json <- content(response, "text", encoding = "UTF-8")
+  data_list <- fromJSON(data_json, flatten = TRUE)
+  
+  # Return the articles (add a language column for reference)
+  articles <- data_list$articles
+  articles$language <- lang
+  return(articles)
+})
+
+# Preview the combined dataset
+head(articles_df)
+
+```
+
+
+```{r}
+# Select key columns and add a document_id (if not already present)
+articles_df <- articles_df %>%
+  mutate(document_id = row_number()) %>%
+  select(document_id, publishedAt, source = source.name, author, title, description, content)
+
+# Export the cleaned raw articles for future reference
+write_csv(articles_df, "cleaned_articles.csv")
+
+# Clean the text: convert to lowercase and remove URLs, digits, and punctuation.
+# We'll use the 'title' column for demonstration.
+articles_df <- articles_df %>%
+  mutate(title_clean = tolower(title),
+         title_clean = str_replace_all(title_clean, "http\\S+\\s*", ""),  # Remove URLs
+         title_clean = str_replace_all(title_clean, "[[:digit:]]", ""),     # Remove digits
+         title_clean = str_replace_all(title_clean, "[[:punct:]]", ""))       # Remove punctuation
+
+# Preview the cleaned text
+head(articles_df[, c("document_id", "title", "title_clean")])
+
+```
+```{r}
+# Extract stopwords as a vector
+stop_words_vector <- get_stopwords(language = "en")$word
+
+# Tokenize the cleaned text (using title_clean) and remove stopwords.
+article_tokens <- articles_df %>%
+  select(document_id, title_clean) %>%
+  unnest_tokens(word, title_clean) %>%  # split into words
+  filter(!word %in% stop_words_vector)
+
+# Apply stemming using the Porter Stemmer
+article_tokens <- article_tokens %>%
+  mutate(word = wordStem(word, language = "en"))
+
+# Preview tokenized and stemmed data
+head(article_tokens)
+
+```
+```{r}
+# Calculate document frequency for each token
+word_doc_frequency <- article_tokens %>%
+  distinct(document_id, word) %>%
+  count(word, name = "doc_freq")
+
+# Set a minimum document frequency threshold
+min_doc_freq <- 3
+
+# Keep only tokens that appear in at least `min_doc_freq` documents
+article_tokens_pruned <- article_tokens %>%
+  inner_join(word_doc_frequency, by = "word") %>%
+  filter(doc_freq >= min_doc_freq) %>%
+  select(document_id, word)
+
+# Preview the pruned tokens
+head(article_tokens_pruned)
+# Export pruned tokens for sharing/verification
+write_csv(article_tokens_pruned, "tokens_pruned.csv")
+
+```
+```{r}
+# Count word frequency per document
+word_counts <- article_tokens_pruned %>%
+  count(document_id, word, sort = TRUE)
+
+# Convert long format to wide: each row is a document and each column is a token.
+document_term_matrix <- word_counts %>%
+  pivot_wider(names_from = word, values_from = n, values_fill = list(n = 0))
+
+# Preview the DTM
+head(document_term_matrix)
+
+# export the DTM
+write_csv(document_term_matrix, "document_term_matrix.csv")
+
+```
+
+
+
+
+Speeches
+```{r}
+
+library(readr)
+library(pdftools)
+library(dplyr)
+library(tibble)
+library(tools)
+
+files <- c(
+  "/Users/samantha/Desktop/speech text data/ecb.csv",
+  "/Users/samantha/Desktop/speech text data/Implications of Higher Tariffs.pdf",
+  "/Users/samantha/Desktop/speech text data/rc_speech2.csv",
+  "/Users/samantha/Desktop/speech text data/rc_Speech3.csv",
+  "/Users/samantha/Desktop/speech text data/Roll_Call_speech1.csv",
+  "/Users/samantha/Desktop/speech text data/rollcall (1).csv",
+  "/Users/samantha/Desktop/speech text data/rollcall (2).csv",
+  "/Users/samantha/Desktop/speech text data/rollcall (3).csv",
+  "/Users/samantha/Desktop/speech text data/rollcall (4).csv",
+  "/Users/samantha/Desktop/speech text data/rollcall (5).csv",
+  "/Users/samantha/Desktop/speech text data/rollcall (6).csv",
+  "/Users/samantha/Desktop/speech text data/rollcall.csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (1).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (2).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (3).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (4).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (5).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (6).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (7).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (8).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse (9).csv",
+  "/Users/samantha/Desktop/speech text data/whitehouse.csv"
+)
+
+process_file <- function(filepath) {
+  # Determine file extension
+  ext <- file_ext(filepath)
+  
+  if (ext == "pdf") {
+    # For PDFs: extract text from all pages and combine into one string
+    text_vector <- pdf_text(filepath)
+    text_combined <- paste(text_vector, collapse = "\n")
+    return(text_combined)
+  } else if (ext == "csv") {
+    # Read the CSV file
+    df <- read_csv(filepath, show_col_types = FALSE)
+    
+    # If the file name contains "rollcall", extract only the column "flex-auto"
+    if (grepl("rollcall", filepath, ignore.case = TRUE)) {
+      if ("flex-auto" %in% names(df)) {
+        # Use only the "flex-auto" column
+        row_texts <- df[["flex-auto"]]
+      } else {
+        warning("The file ", filepath, " does not contain a 'flex-auto' column. Returning NA.")
+        return(NA_character_)
+      }
+    } else {
+      # Otherwise, concatenate all columns
+      row_texts <- apply(df, 1, paste, collapse = " ")
+    }
+    
+    text_combined <- paste(row_texts, collapse = "\n")
+    return(text_combined)
+  } else {
+    warning("File type not supported for file: ", filepath)
+    return(NA_character_)
+  }
+}
+
+# Create a data frame of file names and their extracted text
+results <- lapply(files, function(x) {
+  text <- process_file(x)
+  tibble(file = x, content = text)
+})
+
+# Combine the individual tibbles into one data frame
+all_texts <- bind_rows(results)
+
+# View the first few entries
+print(head(all_texts))
+
+# Export the data frame as a CSV file
+write_csv(all_texts, "/Users/samantha/Desktop/speech text data/combined_text_data.csv")
+
+
+
+```
+```{r}
+library(readr)
+library(dplyr)
+
+# Import the combined text data (change the file path as needed)
+raw_df <- read_csv("/Users/samantha/Desktop/speech text data/combined_text_data.csv")
+
+
+# Preview the imported data
+glimpse(raw_df)
+head(raw_df)
+
+
+```
+```{r}
+
+library(stringr)
+
+clean_df <- raw_df %>%
+  mutate(
+    doc_id = row_number(),               # Create a unique document identifier
+    text_clean = tolower(content),         # Convert to lowercase
+    text_clean = str_replace_all(text_clean, "<.*?>", " "),   # Remove HTML tags
+    text_clean = str_replace_all(text_clean, "[[:digit:]]+", " "),  # Remove numbers
+    text_clean = str_replace_all(text_clean, "[[:punct:]]", " "),    # Remove punctuation
+    text_clean = str_squish(text_clean)    # Remove extra whitespace
+  )
+
+# Preview the cleaned data
+head(clean_df[, c("doc_id", "content", "text_clean")])
+
+
+```
+```{r}
+
+library(tidytext)
+library(SnowballC)
+
+tokens_df <- clean_df %>%
+  # Select the document identifier and cleaned text column
+  select(doc_id, text_clean) %>%
+  # Tokenize the text into individual words
+  unnest_tokens(word, text_clean) %>%
+  # Remove common stopwords (using the tidytext stop_words data)
+  anti_join(get_stopwords(), by = "word") %>%
+  # Apply stemming to reduce words to their root form
+  mutate(word = wordStem(word, language = "en"))
+
+# Check the tokenized data
+head(tokens_df)
+
+
+```
+
+```{r}
+library(tidyr)
+
+# Count word frequencies per document
+word_freq <- tokens_df %>%
+  count(doc_id, word, sort = TRUE)
+
+# Transform the long data (word frequency per doc) into a wide Document-Term Matrix
+doc_term_matrix <- word_freq %>%
+  pivot_wider(names_from = word, values_from = n, values_fill = list(n = 0))
+
+# Preview the Document-Term Matrix
+head(doc_term_matrix)
+
+write_csv(clean_df, "/Users/samantha/Desktop/speech text data/clean_df.csv")
+write_csv(tokens_df, "/Users/samantha/Desktop/speech text data/tokens_df.csv")
+write_csv(doc_term_matrix, "/Users/samantha/Desktop/speech text data/doc_term_matrix.csv")
+
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,608 @@
+---
+title: "Text Impacts on Company-level Stocks"
+author: "Group 5"
+date: "2025-04-25"
+output: html_document
+---
+```{r}
+# Load required libraries
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+# Load your article dataset
+df <- read_excel("~/desktop/articles_with_finbert_no_filter.xlsx")
+
+# Ensure Timestamp is in POSIXct format
+df$Timestamp <- as.POSIXct(df$Timestamp)
+
+# Create a time-based summary (e.g., by day or 1 minute block)
+df$Date <- as.Date(df$Timestamp)
+df$HourBlock <- floor_date(df$Timestamp, unit = "1 minute")
+
+# Article counts over time
+ggplot(df, aes(x = HourBlock)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Article Counts Over Time", x = "1-minute Block", y = "Number of Articles")
+
+# Word count per article
+df$Word_Count <- sapply(strsplit(df$Text, "\\s+"), length)
+ggplot(df, aes(x = Word_Count)) +
+  geom_histogram(binwidth = 10, fill = "darkgreen") +
+  labs(title = "Distribution of Word Counts", x = "Word Count", y = "Number of Articles")
+
+# Sentiment category bar chart
+df$Sentiment_Category <- ifelse(df$Sentiment > 0.05, "Positive",
+                                ifelse(df$Sentiment < -0.05, "Negative", "Neutral"))
+
+ggplot(df, aes(x = Sentiment_Category)) +
+  geom_bar(fill = "purple") +
+  labs(title = "Sentiment Category Distribution", x = "Category", y = "Count")
+
+# Sentiment category over time
+ggplot(df, aes(x = HourBlock, fill = Sentiment_Category)) +
+  geom_bar(position = "stack") +
+  labs(title = "Sentiment Over Time", x = "Time", y = "Count")
+
+# Summary table
+summary_table <- df %>%
+  summarise(
+    Total_Articles = n(),
+    Unique_Time_Blocks = n_distinct(HourBlock),
+    Avg_Word_Count = round(mean(Word_Count), 1),
+    Positive_Perc = round(mean(Sentiment_Category == "Positive") * 100, 1),
+    Neutral_Perc = round(mean(Sentiment_Category == "Neutral") * 100, 1),
+    Negative_Perc = round(mean(Sentiment_Category == "Negative") * 100, 1)
+  )
+
+print(summary_table)
+
+```
+
+LASSO:
+
+
+We are analyzing 14 companies separately.
+
+For each company, we build one LASSO model:
+
+Input (X): 768 FinBERT embeddings
+
+Output (y): minute-level stock return
+
+We used LASSO (important features) to select nonzero features. And we got the top feature (embedding dimension) with the largest absolute coefficient for each company. And this identifies the strongest predictor among the FinBERT features for each company.
+
+
+We are also choosing lambda_min(optimal) of each company in this part which is the best regularization parameter found by cross-validation.Best lambda balances fit and sparsity.
+
+
+In addition, in order to evaluate prediction performance we add an accuracy metrics in the summary table, which includes:MSE (Mean Squared Error),RMSE (Root Mean Squared Error),MAE (Mean Absolute Error), and R² (Coefficient of Determination).
+
+```{r}
+# 1. Load libraries
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(glmnet)
+library(ggplot2)
+library(writexl)
+library(tidyr)
+
+# 2. Set working directory 
+setwd(path.expand("~/Desktop/570 final project/companies"))
+
+# 3. Read data
+df <- read_excel("company_minute_merged_with_lags.xlsx")
+
+# 4. Identify embedding columns and company prefixes
+df_cols <- colnames(df)
+embed_cols <- df_cols[grepl("^finbert_", df_cols)]
+company_prefixes <- unique(sub("_open$", "", df_cols[grepl("_open$", df_cols)]))
+
+# 5. Prepare results container
+results <- data.frame(
+  Company           = character(),
+  Lambda_Min        = numeric(),
+  Top_Feature       = character(),
+  Top_Coefficient   = numeric(),
+  Nonzero_Features  = character(),
+  Total_Rows        = integer(),
+  stringsAsFactors  = FALSE
+)
+
+# 6. Prepare a copy of df to store all new return columns
+df_combined <- df
+
+# 7. Loop over each company
+for (prefix in company_prefixes) {
+  message("\nProcessing company: ", prefix)
+  open_col  <- paste0(prefix, "_open")
+  close_col <- paste0(prefix, "_close")
+
+  # Skip if essential columns missing
+  req_cols <- c(open_col, close_col, embed_cols)
+  if (!all(req_cols %in% df_cols)) next
+
+  # 8. Compute clean returns
+  sub <- df %>%
+    arrange(Minute_Timestamp) %>%
+    mutate(
+      return_pct = ifelse(!is.na(.data[[open_col]]) & !is.na(.data[[close_col]]),
+                          (.data[[close_col]] - .data[[open_col]]) / .data[[open_col]] * 100,
+                          NA_real_),   # important: no fake 0
+      return_rate = ifelse(!is.na(.data[[open_col]]) & !is.na(.data[[close_col]]),
+                           (.data[[close_col]] - .data[[open_col]]) / .data[[open_col]],
+                           NA_real_),   # important: no fake 0
+      
+    )
+
+  # Add returns into combined df
+  df_combined[[paste0(prefix, "_return_pct")]]  <- sub$return_pct
+  df_combined[[paste0(prefix, "_return_rate")]] <- sub$return_rate
+
+
+
+  # 9. Filter only for available target and lagged features
+  model_df <- sub %>%
+    filter(!is.na(return_rate))  # only real returns
+  total_rows <- nrow(model_df)
+  if (total_rows == 0) next
+
+  # 10. Build feature matrix and response
+  feature_cols <- c(embed_cols)
+  model_df <- model_df %>%
+    mutate(across(all_of(feature_cols), ~replace_na(.x, 0)))
+  X <- as.matrix(model_df %>% select(all_of(feature_cols)))
+  y <- model_df$return_rate
+
+  # 11. Fit LASSO
+  set.seed(123)
+  cvfit <- cv.glmnet(X, y, alpha = 1, nfolds = 5)
+
+  # 12. Extract results
+  lambda_min <- cvfit$lambda.min
+  coefs_mat <- as.matrix(coef(cvfit, s = "lambda.min"))
+  nz_feats <- rownames(coefs_mat)[coefs_mat[,1] != 0]
+  nz_feats <- nz_feats[nz_feats != "(Intercept)"]
+  coef_vals <- coefs_mat[nz_feats, 1]
+  top_idx <- which.max(abs(coef_vals))
+  top_feat <- nz_feats[top_idx]
+  top_coef <- coef_vals[top_idx]
+
+  y_pred <- predict(cvfit, newx = X, s = "lambda.min")
+  mse_val <- mean((y - y_pred)^2)
+  rmse_val <- sqrt(mse_val)
+  mae_val <- mean(abs(y - y_pred))
+  sst <- sum((y - mean(y))^2)
+  sse <- sum((y - y_pred)^2)
+  r2_val <- 1 - sse/sst
+
+  # 13. Save plots 
+  png(file.path("~/Desktop/570 final project/companies", paste0(prefix, "_lasso_cv.png")), width = 600, height = 400)
+  plot(cvfit)
+  dev.off()
+
+  coef_df <- data.frame(Feature = nz_feats, Coefficient = coef_vals)
+  p_coef <- ggplot(coef_df, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(
+      title = paste0(prefix, " - Nonzero Lagged Embedding Coefficients"),
+      x = "Feature",
+      y = "Coefficient"
+    ) +
+    theme_minimal()
+  ggsave(file.path("~/Desktop/570 final project/companies", paste0(prefix, "_coeffs.png")), plot = p_coef, width = 6, height = 4)
+
+  # 14. Append to summary
+  results <- bind_rows(results, tibble(
+    Company          = prefix,
+    Lambda_Min       = lambda_min,
+    Top_Feature      = top_feat,
+    Top_Coefficient  = top_coef,
+    Nonzero_Features = paste(nz_feats, collapse = ", "),
+    Total_Rows       = total_rows,
+    MSE              = mse_val,
+    RMSE             = rmse_val,
+    MAE              = mae_val,
+    R2               = r2_val
+  ))
+}
+
+# 15. Save combined data with all returns
+write_xlsx(df_combined, "company_minute_with_returns_clean.xlsx")
+
+# 16. Save summary table
+write_xlsx(results, "lasso_company_embeddings_lagged_results.xlsx")
+
+# 17. Plot comparison of lambdas
+if (nrow(results) > 0) {
+  p_lambda <- ggplot(results, aes(x = reorder(Company, Lambda_Min), y = Lambda_Min)) +
+    geom_col(fill = "darkgreen") +
+    coord_flip() +
+    labs(
+      title = "Optimal Lambda (min) by Company (Current & Lagged Embeddings)",
+      x = "Company",
+      y = "Lambda (min)"
+    ) +
+    theme_minimal()
+  ggsave("lambda_min_by_company_lagged.png", plot = p_lambda, width = 6, height = 4)
+}
+
+
+```
+```{r}
+# Check non-missing return points for each company
+data_points <- sapply(company_prefixes, function(prefix) {
+  sum(!is.na(df_combined[[paste0(prefix, "_return_rate")]]))
+})
+print(data_points)
+# Show the result
+
+```
+Through this, we can see we have 350 non-missing return points for each company.
+
+```{r}
+library(ggplot2)
+
+ggplot(results, aes(x = reorder(Company, R2), y = R2)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Model R² by Company",
+       x = "Company",
+       y = "R² (Explained Variance)") +
+  theme_minimal()
+
+ggplot(results, aes(x = reorder(Company, Lambda_Min), y = Lambda_Min)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Optimal Lambda (λ) by Company",
+       x = "Company",
+       y = "Lambda (min)") +
+  theme_minimal()
+
+library(dplyr)
+
+results %>%
+  count(Top_Feature, sort = TRUE) %>%
+  top_n(10) %>%
+  ggplot(aes(x = reorder(Top_Feature, n), y = n)) +
+  geom_col(fill = "darkorchid") +
+  coord_flip() +
+  labs(title = "Most Frequently Selected Top FinBERT Features",
+       x = "FinBERT Feature",
+       y = "Count Across Companies") +
+  theme_minimal()
+
+ggplot(results, aes(x = reorder(Company, abs(Top_Coefficient)), y = Top_Coefficient, fill = Top_Coefficient > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("red", "green"), guide = FALSE) +
+  labs(title = "Top LASSO Coefficient by Company",
+       x = "Company",
+       y = "Coefficient Value") +
+  theme_minimal()
+
+```
+
+
+
+
+
+```{r}
+# add_lagged_embeddings to merged data.
+
+# 1. Load libraries
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(writexl)
+
+# 2. Read data
+df <- read.csv("~/Desktop/Minute-Aligned_Article_and_Stock_Dataset.csv")
+
+
+# 3. Identify all the finbert_* columns
+embed_cols <- grep("^finbert_", names(df), value = TRUE)
+
+# 4. Create lag-1 versions of each embedding
+df_with_lags <- df %>%
+  mutate(
+    across(
+      all_of(embed_cols),
+      ~lag(.x, 5),
+      .names = "{.col}_lag1"
+    )
+  )
+
+# 5. Write out the augmented dataset
+write_xlsx(
+  df_with_lags,
+  path = "company_minute_merged_with_lags.xlsx"
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+XGBoost:
+```{r}
+
+# Load libraries
+library(RColorBrewer)
+library(readxl)
+library(dplyr)
+library(xgboost)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(writexl)
+library(tidyr)
+
+# 1. Load your data
+df <- read_excel("company_minute_with_returns_clean.xlsx") %>%
+  arrange(Minute_Timestamp)
+
+# 2. Ensure Time_Block_Count is numeric
+df <- df %>%
+  mutate(Time_Block_Count = as.numeric(Time_Block_Count))
+
+# 3. Companies
+companies <- c("AAPL", "TSLA", "INTC", "AMD", "NVDA", "F", "GM", "WHR", "NKE", "CAT", "BA", "BABA", "JD", "PDD")
+
+# 4. Features
+features <- c("finbert_315", "finbert_156", "finbert_59", "finbert_634", "finbert_29_lag1")
+
+# 5. Storage
+results <- data.frame()
+roc_data_list <- list()
+feature_importances <- list()
+
+# 6. Loop
+for (company in companies) {
+  
+  cat("\nProcessing:", company, "\n")
+  
+  return_col <- paste0(company, "_return_rate")
+  
+  if (!(return_col %in% names(df))) next
+  
+  temp_df <- df %>%
+    mutate(Target = ifelse(.data[[return_col]] > 0, 1, 0)) %>%
+    select(all_of(features), Target) %>%
+    filter(!is.na(Target))
+  
+  if (nrow(temp_df) < 30) {
+    cat("Not enough data for:", company, "\n")
+    next
+  }
+  
+  # Split
+  set.seed(123)
+  train_idx <- createDataPartition(temp_df$Target, p = 0.7, times = 1, list = FALSE)
+  train_data <- temp_df[train_idx, ]
+  test_data <- temp_df[-train_idx, ]
+  
+  X_train <- as.matrix(train_data %>% select(-Target))
+  y_train <- train_data$Target
+  X_test <- as.matrix(test_data %>% select(-Target))
+  y_test <- test_data$Target
+  
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+  dtest <- xgb.DMatrix(data = X_test, label = y_test)
+  
+  # Train
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "error",
+    max_depth = 4,
+    eta = 0.1
+  )
+  
+  set.seed(123)
+  model_xgb <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    watchlist = list(train = dtrain, test = dtest),
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  # Predict
+  pred_probs <- predict(model_xgb, newdata = dtest)
+  pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+  
+  # Evaluate
+  conf_mat <- confusionMatrix(as.factor(pred_labels), factor(y_test))
+  # Save confusion matrix counts
+  conf_summary <- as.data.frame(conf_mat$table)
+  conf_summary$Company <- company
+
+# Append to a global list
+  if (!exists("confusion_all")) {
+  confusion_all <- conf_summary
+  } else {
+  confusion_all <- bind_rows(confusion_all, conf_summary)
+  }
+
+  roc_obj <- roc(y_test, pred_probs)
+  
+  accuracy <- conf_mat$overall["Accuracy"]
+  auc_value <- auc(roc_obj)
+  
+  # Save results
+  results <- rbind(results, data.frame(
+    Company = company,
+    Accuracy = round(as.numeric(accuracy), 3),
+    AUC = round(as.numeric(auc_value), 3)
+  ))
+  
+  # Save ROC data
+  roc_df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Company = company
+  )
+  roc_data_list[[company]] <- roc_df
+  
+  # Save Feature Importances
+  imp <- xgb.importance(feature_names = colnames(X_train), model = model_xgb)
+  feature_importances[[company]] <- imp
+}
+
+# 7. Combine all ROC curves
+roc_data_all <- bind_rows(roc_data_list)
+
+# 8. Save results
+write_xlsx(results, "xgboost_classification_results.xlsx")
+
+# Save feature importances
+feature_imp_combined <- bind_rows(lapply(names(feature_importances), function(name) {
+  feature_importances[[name]] %>% mutate(Company = name)
+}))
+write_xlsx(feature_imp_combined, "xgboost_feature_importances.xlsx")
+
+# Take top 5 features per company
+top_features <- feature_imp_combined %>%
+  group_by(Company) %>%
+  top_n(5, wt = Gain) %>%
+  ungroup()
+
+# Plot feature importance per company
+ggplot(top_features, aes(x = reorder(Feature, Gain), y = Gain, fill = Feature)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Company, scales = "free_y") +
+  labs(
+    title = "Top 5 Feature Importances by Company",
+    x = "Feature",
+    y = "Gain"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave("xgboost_feature_importance_facet.png", width = 12, height = 10, dpi = 300)
+
+# Average gain across companies
+avg_feature_imp <- feature_imp_combined %>%
+  group_by(Feature) %>%
+  summarise(Avg_Gain = mean(Gain), .groups = "drop") %>%
+  arrange(desc(Avg_Gain))
+
+# Plot
+ggplot(avg_feature_imp, aes(x = reorder(Feature, Avg_Gain), y = Avg_Gain, fill = Feature)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Average Feature Importance Across All Companies",
+    x = "Feature",
+    y = "Average Gain"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave("xgboost_feature_importance_avg.png", width = 8, height = 6, dpi = 300)
+
+
+# 9. Plot Accuracy and AUC
+results_long <- results %>%
+  pivot_longer(cols = c(Accuracy, AUC), names_to = "Metric", values_to = "Value")
+
+ggplot(results_long, aes(x = reorder(Company, Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "XGBoost Classification Results by Company",
+    x = "Company",
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal()
+
+ggsave("xgboost_accuracy_auc_comparison.png", width = 10, height = 6, dpi = 300)
+
+# 10. Plot ROC Curves all in one plot
+
+# Create a palette of 14 colors using colorRampPalette
+palette_14 <- colorRampPalette(brewer.pal(9, "Set1"))(length(unique(roc_data_all$Company)))
+
+# ROC plot
+# Create a palette of 14 colors using colorRampPalette
+palette_14 <- colorRampPalette(brewer.pal(9, "Set1"))(length(unique(roc_data_all$Company)))
+
+# ROC plot
+ggplot(roc_data_all, aes(x = FPR, y = TPR, color = Company)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  scale_color_manual(values = palette_14) +
+  labs(
+    title = "ROC Curves for All Companies",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal()
+
+ggsave("xgboost_roc_curves_all_companies.png", width = 10, height = 8, dpi = 300)
+
+#confusion matrix plot
+# Aggregate confusion matrix counts across all companies
+confusion_summary_all <- confusion_all %>%
+  group_by(Prediction, Reference) %>%
+  summarise(Total = sum(Freq), .groups = "drop")
+
+# Create overall confusion matrix heatmap
+conf_overall_plot <- ggplot(confusion_summary_all, aes(x = Prediction, y = Reference, fill = Total)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Total), color = "white", size = 6) +
+  scale_fill_gradient(low = "skyblue", high = "darkblue") +
+  labs(
+    title = "Overall Confusion Matrix (All Companies Combined)",
+    x = "Predicted Label",
+    y = "Actual Label"
+  ) +
+  theme_minimal()
+
+ggsave("overall_confusion_matrix_all_companies.png", plot = conf_overall_plot, width = 6, height = 5, dpi = 300)
+
+
+message("Full XGBoost Classification pipeline + feature importance + ROC curves completed!")
+
+
+
+```
+
+
+

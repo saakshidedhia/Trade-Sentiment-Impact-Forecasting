@@ -1,0 +1,1190 @@
+---
+title: "570 Lasso part"
+author: "Group 5"
+date: "2025-04-25"
+output: html_document
+---
+
+LASSO:
+
+
+We are analyzing 14 companies separately.
+
+For each company, we build one LASSO model:
+
+Input (X): 768 FinBERT embeddings
+
+Output (y): 4-hour stock return
+
+We used LASSO (important features) to select nonzero features, and we exclude the intercept. And we got the top feature (embedding dimension) with the largest absolute coefficient for each company. And this identifies the strongest predictor among the FinBERT features for each company.
+
+
+We are also choosing lambda_min(optimal) of each company in this part which is the best regularization parameter found by cross-validation.Best lambda balances fit and sparsity.
+
+
+In addition, in order to evaluate prediction performancewe add an accuracy metrics in the summary table, which includes:MSE (Mean Squared Error),RMSE (Root Mean Squared Error),MAE (Mean Absolute Error), and R² (Coefficient of Determination).
+
+```{r}
+# 1. Load libraries
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(glmnet)
+library(ggplot2)
+library(writexl)
+library(tidyr)
+
+# 2. Set working directory 
+setwd(path.expand("~/Desktop/companies"))
+
+# 3. Read data
+df <- read_excel("company_4h_merged.xlsx")
+
+# 4. Identify embedding columns and company prefixes
+df_cols <- colnames(df)
+embed_cols <- df_cols[grepl("^finbert_", df_cols)]
+company_prefixes <- unique(sub("_open$", "", df_cols[grepl("_open$", df_cols)]))
+
+# 5. Prepare results container
+results <- data.frame(
+  Company           = character(),
+  Lambda_Min        = numeric(),
+  Top_Feature       = character(),
+  Top_Coefficient   = numeric(),
+  Nonzero_Features  = character(),
+  Total_Rows        = integer(),
+  stringsAsFactors  = FALSE
+)
+
+# 6. Prepare a copy of df to store all new return columns
+df_combined <- df
+
+# 7. Loop over each company
+for (prefix in company_prefixes) {
+  message("\nProcessing company: ", prefix)
+  open_col  <- paste0(prefix, "_open")
+  close_col <- paste0(prefix, "_close")
+
+  # Skip if essential columns missing
+  req_cols <- c(open_col, close_col, embed_cols)
+  if (!all(req_cols %in% df_cols)) next
+
+  # 8. Compute clean 4-hour returns
+  sub <- df %>%
+    arrange(Date, Interval_4h) %>%
+    mutate(
+      return_pct = ifelse(!is.na(.data[[open_col]]) & !is.na(.data[[close_col]]),
+                          (.data[[close_col]] - .data[[open_col]]) / .data[[open_col]] * 100,
+                          NA_real_),   # important: no fake 0
+      return_rate = ifelse(!is.na(.data[[open_col]]) & !is.na(.data[[close_col]]),
+                           (.data[[close_col]] - .data[[open_col]]) / .data[[open_col]],
+                           NA_real_),   # important: no fake 0
+      across(all_of(embed_cols), ~lag(.x, 1, default = NA_real_), .names = "{.col}_lag1")
+    )
+
+  # ✅ Add 4-hour returns into combined df
+  df_combined[[paste0(prefix, "_return_pct")]]  <- sub$return_pct
+  df_combined[[paste0(prefix, "_return_rate")]] <- sub$return_rate
+
+  # Define lagged embedding column names
+  lag_embed_cols <- paste0(embed_cols, "_lag1")
+
+  # 9. Filter only for available target and lagged features
+  model_df <- sub %>%
+    filter(!is.na(return_rate))  # only real returns
+  total_rows <- nrow(model_df)
+  if (total_rows == 0) next
+
+  # 10. Build feature matrix and response
+  feature_cols <- c(embed_cols, lag_embed_cols)
+  model_df <- model_df %>%
+    mutate(across(all_of(feature_cols), ~replace_na(.x, 0)))
+  X <- as.matrix(model_df %>% select(all_of(feature_cols)))
+  y <- model_df$return_rate
+
+  # 11. Fit LASSO
+  set.seed(123)
+  cvfit <- cv.glmnet(X, y, alpha = 1, nfolds = 5)
+
+  # 12. Extract results
+  lambda_min <- cvfit$lambda.min
+  coefs_mat <- as.matrix(coef(cvfit, s = "lambda.min"))
+  nz_feats <- rownames(coefs_mat)[coefs_mat[,1] != 0]
+  nz_feats <- nz_feats[nz_feats != "(Intercept)"]
+  coef_vals <- coefs_mat[nz_feats, 1]
+  top_idx <- which.max(abs(coef_vals))
+  top_feat <- nz_feats[top_idx]
+  top_coef <- coef_vals[top_idx]
+
+  y_pred <- predict(cvfit, newx = X, s = "lambda.min")
+  mse_val <- mean((y - y_pred)^2)
+  rmse_val <- sqrt(mse_val)
+  mae_val <- mean(abs(y - y_pred))
+  sst <- sum((y - mean(y))^2)
+  sse <- sum((y - y_pred)^2)
+  r2_val <- 1 - sse/sst
+
+  # 13. Save plots 
+  png(file.path("~/Desktop/companies", paste0(prefix, "_lasso_cv.png")), width = 600, height = 400)
+  plot(cvfit)
+  dev.off()
+
+  coef_df <- data.frame(Feature = nz_feats, Coefficient = coef_vals)
+  p_coef <- ggplot(coef_df, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(
+      title = paste0(prefix, " - Nonzero Lagged Embedding Coefficients"),
+      x = "Feature",
+      y = "Coefficient"
+    ) +
+    theme_minimal()
+  ggsave(file.path("~/Desktop/companies", paste0(prefix, "_coeffs.png")), plot = p_coef, width = 6, height = 4)
+
+  # 14. Append to summary
+  results <- bind_rows(results, tibble(
+    Company          = prefix,
+    Lambda_Min       = lambda_min,
+    Top_Feature      = top_feat,
+    Top_Coefficient  = top_coef,
+    Nonzero_Features = paste(nz_feats, collapse = ", "),
+    Total_Rows       = total_rows,
+    MSE              = mse_val,
+    RMSE             = rmse_val,
+    MAE              = mae_val,
+    R2               = r2_val
+  ))
+}
+
+# 15. Save combined data with all returns
+write_xlsx(df_combined, "company_4h_with_returns_clean.xlsx")
+
+# 16. Save summary table
+write_xlsx(results, "lasso_company_embeddings_lagged_results.xlsx")
+
+# 17. Plot comparison of lambdas
+if (nrow(results) > 0) {
+  p_lambda <- ggplot(results, aes(x = reorder(Company, Lambda_Min), y = Lambda_Min)) +
+    geom_col(fill = "darkgreen") +
+    coord_flip() +
+    labs(
+      title = "Optimal Lambda (min) by Company (Current & Lagged Embeddings)",
+      x = "Company",
+      y = "Lambda (min)"
+    ) +
+    theme_minimal()
+  ggsave("lambda_min_by_company_lagged.png", plot = p_lambda, width = 6, height = 4)
+}
+
+
+```
+```{r}
+# Check non-missing return points for each company
+data_points <- sapply(company_prefixes, function(prefix) {
+  sum(!is.na(df_combined[[paste0(prefix, "_return_rate")]]))
+})
+print(data_points)
+# Show the result
+
+```
+Through this, we can see we have 309 non-missing return points for each company.
+
+
+
+
+
+
+```{r}
+# add_lagged_embeddings to merged data.
+
+# 1. Load libraries
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(writexl)
+
+# 2. Read data
+df <- read_excel("company_4h_merged.xlsx")
+
+
+# 3. Identify all the finbert_* columns
+embed_cols <- grep("^finbert_", names(df), value = TRUE)
+
+# 4. Create lag-1 versions of each embedding
+df_with_lags <- df %>%
+  mutate(
+    across(
+      all_of(embed_cols),
+      ~lag(.x, 5),
+      .names = "{.col}_lag1"
+    )
+  )
+
+# 5. Write out the augmented dataset
+write_xlsx(
+  df_with_lags,
+  path = "company_4h_merged_with_lags.xlsx"
+)
+```
+
+
+AAPL
+```{r}
+# Read LASSO summary
+library(readxl); library(dplyr)
+
+res <- read_excel("lasso_company_embeddings_lagged_results.xlsx")
+#  AAPL’s top feature is:
+res %>% filter(Company=="AAPL") %>% pull(Top_Feature)
+
+# Load merged block‐level data
+blocks <- read_excel("company_4h_merged_with_lags.xlsx")
+
+top_feat  <- res %>% filter(Company=="AAPL") %>% pull(Top_Feature)
+
+# Take the top 5 blocks where that embedding was highest
+top_blocks <- blocks %>%
+  filter(!is.na(.data[[top_feat]])) %>%
+  arrange(desc(.data[[top_feat]])) %>%
+  slice_head(n = 5) %>%
+  select(Time_Block, all_of(top_feat))
+
+print(top_blocks)
+
+articles <- read_excel("company_4h_merged_with_lags.xlsx")
+
+triggers_AAPL <- articles %>%
+  filter(Time_Block %in% top_blocks$Time_Block) %>%
+  select(Time_Block, Article_Number, `Article title`,Text, `Source title`, Sentiment)
+
+print(triggers_AAPL)
+```
+
+TSLA
+```{r}
+# Read LASSO summary
+library(readxl); library(dplyr)
+
+res <- read_excel("lasso_company_embeddings_lagged_results.xlsx")
+#TSLA’s top feature is:
+res %>% filter(Company=="TSLA") %>% pull(Top_Feature)
+
+# Load merged block‐level data
+blocks <- read_excel("company_4h_merged_with_lags.xlsx")
+
+top_feat  <- res %>% filter(Company=="TSLA") %>% pull(Top_Feature)
+
+# Take the top 5 blocks where that embedding was highest
+top_blocks <- blocks %>%
+  filter(!is.na(.data[[top_feat]])) %>%
+  arrange(desc(.data[[top_feat]])) %>%
+  slice_head(n = 5) %>%
+  select(Time_Block, all_of(top_feat))
+
+print(top_blocks)
+
+articles <- read_excel("company_4h_merged_with_lags.xlsx")
+
+triggers_TSLA <- articles %>%
+  filter(Time_Block %in% top_blocks$Time_Block) %>%
+  select(Time_Block, Article_Number, `Article title`,Text, `Source title`, Sentiment)
+
+print(triggers_TSLA)
+```
+
+INTC:
+```{r}
+# Read LASSO summary
+library(readxl); library(dplyr)
+
+res <- read_excel("lasso_company_embeddings_lagged_results.xlsx")
+# For example, INTC’s top feature is:
+res %>% filter(Company=="INTC") %>% pull(Top_Feature)
+
+# Load merged block‐level data
+blocks <- read_excel("company_4h_merged_with_lags.xlsx")
+
+top_feat  <- res %>% filter(Company=="INTC") %>% pull(Top_Feature)
+
+# Take the top 5 blocks where that embedding was highest
+top_blocks <- blocks %>%
+  filter(!is.na(.data[[top_feat]])) %>%
+  arrange(desc(.data[[top_feat]])) %>%
+  slice_head(n = 5) %>%
+  select(Time_Block, all_of(top_feat))
+
+print(top_blocks)
+
+articles <- read_excel("company_4h_merged_with_lags.xlsx")
+
+triggers_INTC <- articles %>%
+  filter(Time_Block %in% top_blocks$Time_Block) %>%
+  select(Time_Block, Article_Number, `Article title`,Text, `Source title`, Sentiment)
+
+print(triggers_INTC)
+```
+
+AMD:
+```{r}
+# Read LASSO summary
+library(readxl); library(dplyr)
+
+res <- read_excel("lasso_company_embeddings_lagged_results.xlsx")
+# For example, AMD’s top feature is:
+res %>% filter(Company=="AMD") %>% pull(Top_Feature)
+
+# Load merged block‐level data
+blocks <- read_excel("company_4h_merged_with_lags.xlsx")
+
+top_feat  <- res %>% filter(Company=="AMD") %>% pull(Top_Feature)
+
+# Take the top 5 blocks where that embedding was highest
+top_blocks <- blocks %>%
+  filter(!is.na(.data[[top_feat]])) %>%
+  arrange(desc(.data[[top_feat]])) %>%
+  slice_head(n = 5) %>%
+  select(Time_Block, all_of(top_feat))
+
+print(top_blocks)
+
+articles <- read_excel("company_4h_merged_with_lags.xlsx")
+
+triggers_AMD <- articles %>%
+  filter(Time_Block %in% top_blocks$Time_Block) %>%
+  select(Time_Block, Article_Number, `Article title`,Text, `Source title`, Sentiment)
+
+print(triggers_AMD)
+```
+
+NKE:
+```{r}
+# Read LASSO summary
+library(readxl); library(dplyr)
+
+res <- read_excel("lasso_company_embeddings_lagged_results.xlsx")
+# For example, NKE’s top feature is:
+res %>% filter(Company=="NKE") %>% pull(Top_Feature)
+
+# Load merged block‐level data
+blocks <- read_excel("company_4h_merged_with_lags.xlsx")
+
+top_feat  <- res %>% filter(Company=="NKE") %>% pull(Top_Feature)
+
+# Take the top 5 blocks where that embedding was highest
+top_blocks <- blocks %>%
+  filter(!is.na(.data[[top_feat]])) %>%
+  arrange(desc(.data[[top_feat]])) %>%
+  slice_head(n = 5) %>%
+  select(Time_Block, all_of(top_feat))
+
+print(top_blocks)
+
+articles <- read_excel("company_4h_merged_with_lags.xlsx")
+
+triggers_NKE <- articles %>%
+  filter(Time_Block %in% top_blocks$Time_Block) %>%
+  select(Time_Block, Article_Number, `Article title`,Text, `Source title`, Sentiment)
+
+print(triggers_NKE)
+```
+
+JD:
+```{r}
+# Read LASSO summary
+library(readxl); library(dplyr)
+
+res <- read_excel("lasso_company_embeddings_lagged_results.xlsx")
+# For example, JD’s top feature is:
+res %>% filter(Company=="JD") %>% pull(Top_Feature)
+
+# Load merged block‐level data
+blocks <- read_excel("company_4h_merged_with_lags.xlsx")
+
+top_feat  <- res %>% filter(Company=="JD") %>% pull(Top_Feature)
+
+# Take the top 5 blocks where that embedding was highest
+top_blocks <- blocks %>%
+  filter(!is.na(.data[[top_feat]])) %>%
+  arrange(desc(.data[[top_feat]])) %>%
+  slice_head(n = 5) %>%
+  select(Time_Block, all_of(top_feat))
+
+print(top_blocks)
+
+articles <- read_excel("company_4h_merged_with_lags.xlsx")
+
+triggers_JD <- articles %>%
+  filter(Time_Block %in% top_blocks$Time_Block) %>%
+  select(Time_Block, Article_Number, `Article title`,Text, `Source title`, Sentiment)
+
+print(triggers_JD)
+```
+
+
+
+```{r}
+
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. 
+aapl_articles <- triggers_AAPL %>%
+  pull(Text)
+
+# 2. Prepare corpus
+corpus <- Corpus(VectorSource(aapl_articles))
+
+# 3. Basic cleaning
+corpus <- corpus %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stripWhitespace)
+
+# 4. Create Term-Document Matrix
+tdm <- TermDocumentMatrix(corpus)
+m   <- as.matrix(tdm)
+word_freqs <- sort(rowSums(m), decreasing=TRUE)
+df <- data.frame(word=names(word_freqs), freq=word_freqs)
+
+# 5. Plot Word Cloud
+set.seed(1234)
+wordcloud(words = df$word,
+          freq = df$freq,
+          min.freq = 2,
+          max.words = 100,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+
+title("Word Cloud for AAPL Top Trigger Articles")
+
+
+
+library(ggplot2)
+
+
+# 6. Sentiment histogram
+ggplot(triggers_AAPL, aes(x = Sentiment)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Sentiment Distribution - AAPL Top Trigger Articles",
+    x = "Sentiment Score",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+# 7. Categorize sentiment
+triggers_AAPL <- triggers_AAPL %>%
+  mutate(Sentiment_Category = case_when(
+    Sentiment > 0.05 ~ "Positive",
+    Sentiment < -0.05 ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# 8. Plot bar chart
+ggplot(triggers_AAPL, aes(x = Sentiment_Category, fill = Sentiment_Category)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Positive" = "forestgreen", "Negative" = "firebrick", "Neutral" = "gray")) +
+  labs(
+    title = "Sentiment Category - AAPL Top Trigger Articles",
+    x = "Sentiment Category",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. 
+TSLA_articles <- triggers_TSLA %>%
+  pull(Text)
+
+# 2. Prepare corpus
+corpus <- Corpus(VectorSource(TSLA_articles))
+
+# 3. Basic cleaning
+corpus <- corpus %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stripWhitespace)
+
+# 4. Create Term-Document Matrix
+tdm <- TermDocumentMatrix(corpus)
+m   <- as.matrix(tdm)
+word_freqs <- sort(rowSums(m), decreasing=TRUE)
+df <- data.frame(word=names(word_freqs), freq=word_freqs)
+
+# 5. Plot Word Cloud
+set.seed(1234)
+wordcloud(words = df$word,
+          freq = df$freq,
+          min.freq = 2,
+          max.words = 100,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+
+title("Word Cloud for TSLA Top Trigger Articles")
+
+
+library(ggplot2)
+
+
+# 6. Sentiment histogram
+ggplot(triggers_TSLA, aes(x = Sentiment)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Sentiment Distribution - TSLA Top Trigger Articles",
+    x = "Sentiment Score",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+# 7. Categorize sentiment
+triggers_TSLA <- triggers_TSLA %>%
+  mutate(Sentiment_Category = case_when(
+    Sentiment > 0.05 ~ "Positive",
+    Sentiment < -0.05 ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# 8. Plot bar chart
+ggplot(triggers_TSLA, aes(x = Sentiment_Category, fill = Sentiment_Category)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Positive" = "forestgreen", "Negative" = "firebrick", "Neutral" = "gray")) +
+  labs(
+    title = "Sentiment Category - TSLA Top Trigger Articles",
+    x = "Sentiment Category",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+
+# 1.
+INTC_articles <- triggers_INTC %>%
+  pull(Text)
+
+# 2. Prepare corpus
+corpus <- Corpus(VectorSource(INTC_articles))
+
+# 3. Basic cleaning
+corpus <- corpus %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stripWhitespace)
+
+# 4. Create Term-Document Matrix
+tdm <- TermDocumentMatrix(corpus)
+m   <- as.matrix(tdm)
+word_freqs <- sort(rowSums(m), decreasing=TRUE)
+df <- data.frame(word=names(word_freqs), freq=word_freqs)
+
+# 5. Plot Word Cloud
+set.seed(1234)
+wordcloud(words = df$word,
+          freq = df$freq,
+          min.freq = 2,
+          max.words = 100,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+
+title("Word Cloud for INTC Top Trigger Articles")
+
+
+library(ggplot2)
+
+
+# 6. Sentiment histogram
+ggplot(triggers_INTC, aes(x = Sentiment)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Sentiment Distribution - INTC Top Trigger Articles",
+    x = "Sentiment Score",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+# 7. Categorize sentiment
+triggers_INTC <- triggers_INTC %>%
+  mutate(Sentiment_Category = case_when(
+    Sentiment > 0.05 ~ "Positive",
+    Sentiment < -0.05 ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# 8. Plot bar chart
+ggplot(triggers_INTC, aes(x = Sentiment_Category, fill = Sentiment_Category)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Positive" = "forestgreen", "Negative" = "firebrick", "Neutral" = "gray")) +
+  labs(
+    title = "Sentiment Category - INTC Top Trigger Articles",
+    x = "Sentiment Category",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. 
+AMD_articles <- triggers_AMD %>%
+  pull(Text)
+
+# 2. Prepare corpus
+corpus <- Corpus(VectorSource(AMD_articles))
+
+# 3. Basic cleaning
+corpus <- corpus %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stripWhitespace)
+
+# 4. Create Term-Document Matrix
+tdm <- TermDocumentMatrix(corpus)
+m   <- as.matrix(tdm)
+word_freqs <- sort(rowSums(m), decreasing=TRUE)
+df <- data.frame(word=names(word_freqs), freq=word_freqs)
+
+# 5. Plot Word Cloud
+set.seed(1234)
+wordcloud(words = df$word,
+          freq = df$freq,
+          min.freq = 2,
+          max.words = 100,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+
+title("Word Cloud for AMD Top Trigger Articles")
+
+
+library(ggplot2)
+
+
+# 6. Sentiment histogram
+ggplot(triggers_AMD, aes(x = Sentiment)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Sentiment Distribution - AMD Top Trigger Articles",
+    x = "Sentiment Score",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+# 7. Categorize sentiment
+triggers_AMD <- triggers_AMD %>%
+  mutate(Sentiment_Category = case_when(
+    Sentiment > 0.05 ~ "Positive",
+    Sentiment < -0.05 ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# 8. Plot bar chart
+ggplot(triggers_AMD, aes(x = Sentiment_Category, fill = Sentiment_Category)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Positive" = "forestgreen", "Negative" = "firebrick", "Neutral" = "gray")) +
+  labs(
+    title = "Sentiment Category - AMD Top Trigger Articles",
+    x = "Sentiment Category",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. 
+NKE_articles <- triggers_NKE %>%
+  pull(Text)
+
+# 2. Prepare corpus
+corpus <- Corpus(VectorSource(NKE_articles))
+
+# 3. Basic cleaning
+corpus <- corpus %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stripWhitespace)
+
+# 4. Create Term-Document Matrix
+tdm <- TermDocumentMatrix(corpus)
+m   <- as.matrix(tdm)
+word_freqs <- sort(rowSums(m), decreasing=TRUE)
+df <- data.frame(word=names(word_freqs), freq=word_freqs)
+
+# 5. Plot Word Cloud
+set.seed(1234)
+wordcloud(words = df$word,
+          freq = df$freq,
+          min.freq = 2,
+          max.words = 100,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+
+title("Word Cloud for NKE Top Trigger Articles")
+
+
+library(ggplot2)
+
+
+# 6. Sentiment histogram
+ggplot(triggers_NKE, aes(x = Sentiment)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Sentiment Distribution - NKE Top Trigger Articles",
+    x = "Sentiment Score",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+# 7. Categorize sentiment
+triggers_NKE <- triggers_NKE %>%
+  mutate(Sentiment_Category = case_when(
+    Sentiment > 0.05 ~ "Positive",
+    Sentiment < -0.05 ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# 8. Plot bar chart
+ggplot(triggers_NKE, aes(x = Sentiment_Category, fill = Sentiment_Category)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Positive" = "forestgreen", "Negative" = "firebrick", "Neutral" = "gray")) +
+  labs(
+    title = "Sentiment Category - NKE Top Trigger Articles",
+    x = "Sentiment Category",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+
+# 1. 
+JD_articles <- triggers_JD %>%
+  pull(Text)
+
+# 2. Prepare corpus
+corpus <- Corpus(VectorSource(JD_articles))
+
+# 3. Basic cleaning
+corpus <- corpus %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(stripWhitespace)
+
+# 4. Create Term-Document Matrix
+tdm <- TermDocumentMatrix(corpus)
+m   <- as.matrix(tdm)
+word_freqs <- sort(rowSums(m), decreasing=TRUE)
+df <- data.frame(word=names(word_freqs), freq=word_freqs)
+
+# 5. Plot Word Cloud
+set.seed(1234)
+wordcloud(words = df$word,
+          freq = df$freq,
+          min.freq = 2,
+          max.words = 100,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+
+title("Word Cloud for JD Top Trigger Articles")
+
+
+library(ggplot2)
+
+
+# 6. Sentiment histogram
+ggplot(triggers_JD, aes(x = Sentiment)) +
+  geom_histogram(binwidth = 0.1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Sentiment Distribution - JD Top Trigger Articles",
+    x = "Sentiment Score",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+
+# 7. Categorize sentiment
+triggers_JD <- triggers_JD %>%
+  mutate(Sentiment_Category = case_when(
+    Sentiment > 0.05 ~ "Positive",
+    Sentiment < -0.05 ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# 8. Plot bar chart
+ggplot(triggers_JD, aes(x = Sentiment_Category, fill = Sentiment_Category)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Positive" = "forestgreen", "Negative" = "firebrick", "Neutral" = "gray")) +
+  labs(
+    title = "Sentiment Category - JD Top Trigger Articles",
+    x = "Sentiment Category",
+    y = "Number of Articles"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+regression Model with Selected Top Features
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(writexl)
+
+# 1. Load your data
+df <- read_excel("company_4h_merged_with_lags.xlsx") %>%
+  arrange(Date, Interval_4h)
+
+# 2. Identify companies based on '_high' (lowercase)
+companies <- df %>%
+  select(ends_with("_high")) %>%
+  names() %>%
+  str_remove("_high$")  # Remove "_high" suffix
+
+print(companies)  # Check extracted companies
+
+# 3. Loop over companies to create Return columns
+for (company in companies) {
+  high_col <- paste0(company, "_high")   # lowercase now
+  return_col <- paste0(company, "_Return")
+  
+  df <- df %>%
+    mutate(!!return_col := ( .data[[high_col]] - lag(.data[[high_col]]) ) / lag(.data[[high_col]]) * 100)
+}
+
+# 4. Save updated file (optional)
+write_xlsx(df, "company_4h_with_returns.xlsx")
+
+message("✅ All company Return columns created successfully!")
+
+
+```
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(writexl)
+
+# 1. Load your data
+df <- read_excel("company_4h_with_returns.xlsx") %>%
+  arrange(Date, Interval_4h)
+
+# 2. Make sure Time_Block_Count is numeric
+df <- df %>%
+  mutate(Time_Block_Count = as.numeric(Time_Block_Count))
+
+# 3. List of companies
+companies <- c("AAPL", "TSLA", "INTC", "AMD", "NVDA", "F", "GM", "WHR", "NKE", "CAT", "BA", "BABA", "JD", "PDD")
+
+# 4. Features to use
+features <- c("finbert_70_lag1", "finbert_493_lag1", "finbert_59", "finbert_48", "finbert_743", "Time_Block_Count")
+
+# 5. Prepare storage
+all_preds <- list()
+r2_table <- data.frame()
+
+# 6. Loop over each company
+for (company in companies) {
+  return_col <- paste0(company, "_Return")
+  
+  if (return_col %in% names(df)) {
+    temp_df <- df %>%
+      select(all_of(features), Return = all_of(return_col)) %>%
+      filter(!is.na(Return))
+    
+    # Build regression
+    model <- lm(Return ~ ., data = temp_df)
+    
+    # Predict
+    preds <- predict(model, newdata = temp_df)
+    
+    # Save predicted and actual
+    temp_result <- data.frame(
+      Company = company,
+      Actual = temp_df$Return,
+      Predicted = preds
+    )
+    
+    all_preds[[company]] <- temp_result
+    
+    # Calculate R-squared
+    r2 <- cor(temp_df$Return, preds, use = "complete.obs")^2
+    r2_table <- rbind(r2_table, data.frame(Company = company, R_squared = r2))
+  }
+}
+
+# 7. Combine predictions
+pred_df <- bind_rows(all_preds)
+
+# 8. Merge R² info
+pred_df <- pred_df %>%
+  left_join(r2_table, by = "Company") %>%
+  mutate(
+    Company_Label = paste0(Company, " (R²=", round(R_squared, 2), ")")
+  )
+
+# 9. Plot 1: Faceted plot with R² in title
+p_facet_r2 <- ggplot(pred_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  facet_wrap(~ Company_Label, scales = "free") +
+  labs(
+    title = "Actual vs Predicted Returns (Facet with R-squared)",
+    x = "Actual Return (%)",
+    y = "Predicted Return (%)"
+  ) +
+  theme_minimal()
+
+# Save plot
+ggsave("actual_vs_predicted_returns_facet_r2.png", plot = p_facet_r2, width = 14, height = 10, dpi = 300)
+
+# 10. Plot 2: Combined scatter plot
+p_combined <- ggplot(pred_df, aes(x = Actual, y = Predicted, color = Company)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(
+    title = "Actual vs Predicted Returns (All Companies Combined)",
+    x = "Actual Return (%)",
+    y = "Predicted Return (%)",
+    color = "Company"
+  ) +
+  theme_minimal()
+
+# Save combined plot
+ggsave("actual_vs_predicted_returns_combined.png", plot = p_combined, width = 12, height = 8, dpi = 300)
+
+# 11. Save R-squared table
+write_xlsx(r2_table, "company_r2_summary.xlsx")
+
+
+
+```
+
+
+
+
+
+
+
+
+XGBoost:
+```{r}
+# Load libraries
+library(readxl)
+library(dplyr)
+library(xgboost)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(writexl)
+library(tidyr)
+
+# 1. Load your data
+df <- read_excel("company_4h_with_returns.xlsx") %>%
+  arrange(Date, Interval_4h)
+
+# 2. Ensure Time_Block_Count is numeric
+df <- df %>%
+  mutate(Time_Block_Count = as.numeric(Time_Block_Count))
+
+# 3. Companies
+companies <- c("AAPL", "TSLA", "INTC", "AMD", "NVDA", "F", "GM", "WHR", "NKE", "CAT", "BA", "BABA", "JD", "PDD")
+
+# 4. Features
+features <- c("finbert_70_lag1", "finbert_493_lag1", "finbert_59", "finbert_48", "finbert_743", "Time_Block_Count")
+
+# 5. Storage
+results <- data.frame()
+roc_data_list <- list()
+feature_importances <- list()
+
+# 6. Loop
+for (company in companies) {
+  
+  cat("\nProcessing:", company, "\n")
+  
+  return_col <- paste0(company, "_Return")
+  
+  if (!(return_col %in% names(df))) next
+  
+  temp_df <- df %>%
+    mutate(Target = ifelse(.data[[return_col]] > 0, 1, 0)) %>%
+    select(all_of(features), Target) %>%
+    filter(!is.na(Target))
+  
+  if (nrow(temp_df) < 30) {
+    cat("Not enough data for:", company, "\n")
+    next
+  }
+  
+  # Split
+  set.seed(123)
+  train_idx <- createDataPartition(temp_df$Target, p = 0.7, list = FALSE)
+  train_data <- temp_df[train_idx, ]
+  test_data <- temp_df[-train_idx, ]
+  
+  X_train <- as.matrix(train_data %>% select(-Target))
+  y_train <- train_data$Target
+  X_test <- as.matrix(test_data %>% select(-Target))
+  y_test <- test_data$Target
+  
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+  dtest <- xgb.DMatrix(data = X_test, label = y_test)
+  
+  # Train
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "error",
+    max_depth = 4,
+    eta = 0.1
+  )
+  
+  set.seed(123)
+  model_xgb <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    watchlist = list(train = dtrain, test = dtest),
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  # Predict
+  pred_probs <- predict(model_xgb, newdata = dtest)
+  pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+  
+  # Evaluate
+  conf_mat <- confusionMatrix(as.factor(pred_labels), as.factor(y_test))
+  roc_obj <- roc(y_test, pred_probs)
+  
+  accuracy <- conf_mat$overall["Accuracy"]
+  auc_value <- auc(roc_obj)
+  
+  # Save results
+  results <- rbind(results, data.frame(
+    Company = company,
+    Accuracy = round(as.numeric(accuracy), 3),
+    AUC = round(as.numeric(auc_value), 3)
+  ))
+  
+  # Save ROC data
+  roc_df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Company = company
+  )
+  roc_data_list[[company]] <- roc_df
+  
+  # Save Feature Importances
+  imp <- xgb.importance(feature_names = colnames(X_train), model = model_xgb)
+  feature_importances[[company]] <- imp
+}
+
+# 7. Combine all ROC curves
+roc_data_all <- bind_rows(roc_data_list)
+
+# 8. Save results
+write_xlsx(results, "xgboost_classification_results.xlsx")
+
+# Save feature importances
+feature_imp_combined <- bind_rows(lapply(names(feature_importances), function(name) {
+  feature_importances[[name]] %>% mutate(Company = name)
+}))
+write_xlsx(feature_imp_combined, "xgboost_feature_importances.xlsx")
+
+# 9. Plot Accuracy and AUC
+results_long <- results %>%
+  pivot_longer(cols = c(Accuracy, AUC), names_to = "Metric", values_to = "Value")
+
+ggplot(results_long, aes(x = reorder(Company, Value), y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "XGBoost Classification Results by Company",
+    x = "Company",
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal()
+
+ggsave("xgboost_accuracy_auc_comparison.png", width = 10, height = 6, dpi = 300)
+
+# 10. Plot ROC Curves all in one plot
+ggplot(roc_data_all, aes(x = FPR, y = TPR, color = Company)) +
+  geom_line(size = 1.1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curves for All Companies",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal()
+
+ggsave("xgboost_roc_curves_all_companies.png", width = 10, height = 8, dpi = 300)
+
+message("Full XGBoost Classification pipeline + feature importance + ROC curves completed!")
+
+
+
+```
+
